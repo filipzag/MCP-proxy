@@ -1,0 +1,17 @@
+{
+    "mcpServers": {
+        "security-detections": {
+            "command": "node",
+            "args": [
+                "dist/index.js"
+            ],
+            "env": {
+                "SIGMA_PATHS": "/home/fzagar/detections/sigma/rules,/home/fzagar/detections/sigma/rules-threat-hunting",
+                "SPLUNK_PATHS": "/home/fzagar/detections/security_content/detections",
+                "ELASTIC_PATHS": "/home/fzagar/detections/detection-rules/rules",
+                "KQL_PATHS": "/home/fzagar/detections/kql-bertjanp,/home/fzagar/detections/kql-jkerai1",
+                "STORY_PATHS": "/home/fzagar/detections/security_content/stories"
+            }
+        }
+    }
+}
