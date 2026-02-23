@@ -98,7 +98,7 @@ class MCPProcess:
                 cwd=MCP_CWD,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE, # Keep stderr separate
+                stderr=sys.stderr, # Direct to sys.stderr so it doesn't block and logs are visible
                 env=MCP_ENV,
                 text=True,
                 bufsize=1  # Line buffered
@@ -173,7 +173,7 @@ class MCPProcess:
             print(f"Error dispatching response: {e}")
 
     async def send_request(self, request_data: dict) -> dict:
-        if not self.process:
+        if not self.process or self.process.poll() is not None:
             raise HTTPException(status_code=500, detail="MCP backend not running")
 
         request_id = request_data.get("id")
@@ -202,12 +202,17 @@ class MCPProcess:
                 if request_id in self.response_futures:
                     del self.response_futures[request_id]
                 raise HTTPException(status_code=504, detail="MCP request timed out")
+            except Exception as e:
+                # MCP Process exit exception
+                if request_id in self.response_futures:
+                    del self.response_futures[request_id]
+                raise HTTPException(status_code=500, detail=str(e))
         
         return {"status": "notification_sent"}
 
     async def send_message(self, request_data: dict):
         """Sends a message without waiting for a direct response (used for /messages)."""
-        if not self.process:
+        if not self.process or self.process.poll() is not None:
             raise HTTPException(status_code=500, detail="MCP backend not running")
             
         async with self.lock:
