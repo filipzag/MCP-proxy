@@ -4,8 +4,12 @@ import threading
 import os
 import sys
 import shlex
+import asyncio
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends, Security, Request
+from fastapi.responses import StreamingResponse
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+
 from pydantic import BaseModel
 import uvicorn
 
@@ -16,6 +20,15 @@ import uvicorn
 
 MCP_CONFIG_FILE = os.environ.get("MCP_CONFIG_FILE")
 MCP_SERVER_NAME = os.environ.get("MCP_SERVER_NAME")
+MCP_AUTH_TOKEN = os.environ.get("MCP_AUTH_TOKEN")
+
+security = HTTPBearer()
+
+async def verify_token(credentials: HTTPAuthorizationCredentials = Security(security)):
+    if MCP_AUTH_TOKEN and credentials.credentials != MCP_AUTH_TOKEN:
+        raise HTTPException(status_code=403, detail="Invalid authentication token")
+    return credentials
+
 
 MCP_COMMAND = []
 MCP_CWD = os.environ.get("MCP_CWD", os.getcwd())
@@ -73,96 +86,194 @@ print(f"Working Directory: {MCP_CWD}")
 class MCPProcess:
     def __init__(self):
         self.process = None
-        self.lock = threading.Lock()
+        self.lock = asyncio.Lock()
+        self.response_futures: dict[str, asyncio.Future] = {}
+        self.sse_queues: list[asyncio.Queue] = []
+        self.reader_task = None
 
-    def start(self):
+    async def start(self):
         try:
             self.process = subprocess.Popen(
                 MCP_COMMAND,
                 cwd=MCP_CWD,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                stderr=subprocess.PIPE, # Keep stderr separate
                 env=MCP_ENV,
                 text=True,
                 bufsize=1  # Line buffered
             )
             print("MCP Server started.")
+            
+            # Start background reader
+            self.reader_task = asyncio.create_task(self._read_loop())
+            
         except Exception as e:
             print(f"Failed to start MCP server: {e}")
             raise
 
-    def stop(self):
+    async def stop(self):
         if self.process:
             self.process.terminate()
-            self.process.wait()
+            # self.process.wait() # avoid blocking
             print("MCP Server stopped.")
+        if self.reader_task:
+            self.reader_task.cancel()
+            try:
+                await self.reader_task
+            except asyncio.CancelledError:
+                pass
 
-    def send_request(self, request_data: dict) -> dict:
+    async def _read_loop(self):
+        """Reads stdout from the MCP process and dispatches messages."""
+        loop = asyncio.get_event_loop()
+        while self.process and self.process.poll() is None:
+            try:
+                # Run blocking readline in executor to avoid blocking the event loop
+                line = await loop.run_in_executor(None, self.process.stdout.readline)
+                if not line:
+                    break
+                
+                await self._dispatch_response(line)
+                
+            except Exception as e:
+                print(f"Error reading from MCP: {e}")
+                break
+        
+        print("MCP Process exited or stream ended.")
+        # Cleanup
+        for future in self.response_futures.values():
+            if not future.done():
+                future.set_exception(Exception("MCP process exited"))
+
+    async def _dispatch_response(self, line: str):
+        """Parses the response line and routes it to futures and SSE queues."""
+        try:
+            # 1. Send to all SSE clients
+            for queue in self.sse_queues:
+                await queue.put(f"data: {line.strip()}\n\n")
+
+            # 2. Check for matching request ID via Future
+            response_json = json.loads(line)
+            if "id" in response_json:
+                req_id = response_json["id"]
+                # JSON-RPC IDs can be int or str. requests map uses what was sent.
+                # We need to handle potential type mismatches if necessary, 
+                # but usually we control the ID generation or pass it through.
+                
+                # Check string keys first (common dict key type) or raw
+                if req_id in self.response_futures:
+                    future = self.response_futures.pop(req_id)
+                    if not future.done():
+                        future.set_result(response_json)
+                        
+        except json.JSONDecodeError:
+            print(f"Failed to decode JSON from server: {line}")
+        except Exception as e:
+            print(f"Error dispatching response: {e}")
+
+    async def send_request(self, request_data: dict) -> dict:
         if not self.process:
             raise HTTPException(status_code=500, detail="MCP backend not running")
 
-        # Check if this is a notification (no id)
-        is_notification = "id" not in request_data
+        request_id = request_data.get("id")
+        should_wait = request_id is not None
 
-        with self.lock:
+        if should_wait:
+            loop = asyncio.get_running_loop()
+            future = loop.create_future()
+            self.response_futures[request_id] = future
+
+        async with self.lock:
             try:
-                # Prepare JSON-RPC message
                 json_str = json.dumps(request_data) + "\n"
-                
-                # Write to stdin
                 self.process.stdin.write(json_str)
                 self.process.stdin.flush()
-                
-                if is_notification:
-                    return {"status": "notification_sent"}
-
-                # Read response from stdout
-                while True:
-                    response_line = self.process.stdout.readline()
-                    
-                    if not response_line:
-                         # Check if process crashed
-                        if self.process.poll() is not None:
-                             stderr = self.process.stderr.read()
-                             print(f"MCP Process crashed. Stderr: {stderr}")
-                             raise HTTPException(status_code=500, detail=f"MCP process exited. Stderr: {stderr}")
-                        return {"error": "No response from MCP server"}
-                    
-                    try:
-                        response_json = json.loads(response_line)
-                        
-                        # Match response ID to request ID
-                        if "id" in response_json and response_json["id"] == request_data["id"]:
-                            return response_json
-                        else:
-                            # Log ignored messages (notifications, logs, mismatched IDs)
-                            print(f"Ignored message from server: {response_line.strip()}")
-                            
-                    except json.JSONDecodeError:
-                        print(f"Failed to decode JSON from server: {response_line}")
-
             except Exception as e:
-                print(f"Error communicating with MCP: {e}")
+                if should_wait and request_id in self.response_futures:
+                     del self.response_futures[request_id]
                 raise HTTPException(status_code=500, detail=str(e))
+
+        if should_wait:
+            try:
+                # Wait for response
+                return await asyncio.wait_for(future, timeout=30.0) # 30s timeout
+            except asyncio.TimeoutError:
+                if request_id in self.response_futures:
+                    del self.response_futures[request_id]
+                raise HTTPException(status_code=504, detail="MCP request timed out")
+        
+        return {"status": "notification_sent"}
+
+    async def send_message(self, request_data: dict):
+        """Sends a message without waiting for a direct response (used for /messages)."""
+        if not self.process:
+            raise HTTPException(status_code=500, detail="MCP backend not running")
+            
+        async with self.lock:
+            try:
+                json_str = json.dumps(request_data) + "\n"
+                self.process.stdin.write(json_str)
+                self.process.stdin.flush()
+            except Exception as e:
+                 raise HTTPException(status_code=500, detail=str(e))
+        return {"status": "sent"}
 
 mcp_backend = MCPProcess()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    mcp_backend.start()
+    await mcp_backend.start()
     yield
-    mcp_backend.stop()
+    await mcp_backend.stop()
 
 app = FastAPI(lifespan=lifespan)
 
 @app.post("/mcp")
-def handle_mcp_request(request: dict):
+async def handle_mcp_request(request: dict, token: HTTPAuthorizationCredentials = Depends(verify_token)):
     """
     Forwards JSON-RPC requests to the MCP server.
+    Waits for a response if 'id' is present.
     """
-    response = mcp_backend.send_request(request)
+    response = await mcp_backend.send_request(request)
     return response
+
+@app.get("/sse")
+async def handle_sse(request: Request, token: HTTPAuthorizationCredentials = Depends(verify_token)):
+    """
+    Establishes an SSE stream for MCP output.
+    """
+    queue = asyncio.Queue()
+    mcp_backend.sse_queues.append(queue)
+    
+    async def event_generator():
+        try:
+            # Yield initial connection message if desired, or just wait for data
+            yield "event: open\ndata: {\"status\": \"connected\"}\n\n"
+            
+            while True:
+                # Check if client disconnected
+                if await request.is_disconnected():
+                    break
+                    
+                data = await queue.get()
+                yield data
+                queue.task_done()
+        except asyncio.CancelledError:
+            pass
+        finally:
+            mcp_backend.sse_queues.remove(queue)
+            
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+@app.post("/messages")
+async def handle_messages(request: dict, token: HTTPAuthorizationCredentials = Depends(verify_token)):
+    """
+    Sends a JSON-RPC message to the MCP server efficiently (no wait for response).
+    Responses will appear in the SSE stream.
+    """
+    return await mcp_backend.send_message(request)
+
 
 @app.get("/health")
 def health_check():

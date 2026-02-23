@@ -9,6 +9,10 @@ A simple Python HTTP proxy server that can bridge any MCP (Model Context Protoco
 - **Pass-through**: Forwards `stdin` and `stdout` JSON-RPC messages.
 - **Notification Handling**: Correctly handles JSON-RPC notifications (no response expected).
 - **Environment Inheritance**: Passes parent environment variables to the MCP process.
+- **Bearer Token Auth**: Optional authentication via `MCP_AUTH_TOKEN`.
+- **SSE Support**: Streamable HTTP via Server-Sent Events (SSE).
+
+
 
 ## Requirements
 
@@ -72,8 +76,30 @@ uvicorn server:app --host 0.0.0.0 --port $MCP_PORT
 
 - `POST /mcp`: Send JSON-RPC body. Returns JSON-RPC response.
 - `GET /health`: Check if MCP process is running.
+- `GET /sse`: Connect to the SSE stream. Receiving messages from the MCP server.
+- `POST /messages`: Send JSON-RPC body asynchronously. Messages are sent to the MCP server, and responses are streamed via SSE.
+
+
+- `GET /health`: Check if MCP process is running.
+
+## Authentication
+
+You can secure the MCP endpoint by setting the `MCP_AUTH_TOKEN` environment variable.
+
+```bash
+export MCP_AUTH_TOKEN="my-secret-token"
+```
+
+When set, the server will require an `Authorization` header:
+
+```http
+Authorization: Bearer my-secret-token
+```
+
+If `MCP_AUTH_TOKEN` is not set, the server runs without authentication.
 
 ## Docker
+
 
 You can containerize this proxy:
 
