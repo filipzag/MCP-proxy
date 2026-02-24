@@ -156,16 +156,15 @@ class MCPProcess:
             # 2. Check for matching request ID via Future
             response_json = json.loads(line)
             if "id" in response_json:
-                req_id = response_json["id"]
-                # JSON-RPC IDs can be int or str. requests map uses what was sent.
-                # We need to handle potential type mismatches if necessary, 
-                # but usually we control the ID generation or pass it through.
+                # Normalize ID to string to avoid int/str type mismatches
+                req_id = str(response_json["id"])
                 
-                # Check string keys first (common dict key type) or raw
                 if req_id in self.response_futures:
                     future = self.response_futures.pop(req_id)
                     if not future.done():
                         future.set_result(response_json)
+                else:
+                    print(f"No matching future for response ID: {req_id} (pending: {list(self.response_futures.keys())})")
                         
         except json.JSONDecodeError:
             print(f"Failed to decode JSON from server: {line}")
@@ -180,6 +179,8 @@ class MCPProcess:
         should_wait = request_id is not None
 
         if should_wait:
+            # Normalize ID to string to avoid int/str type mismatches
+            request_id = str(request_id)
             loop = asyncio.get_running_loop()
             future = loop.create_future()
             self.response_futures[request_id] = future
@@ -196,8 +197,8 @@ class MCPProcess:
 
         if should_wait:
             try:
-                # Wait for response
-                return await asyncio.wait_for(future, timeout=30.0) # 30s timeout
+                # Wait for response (120s to handle slow data-heavy tool calls)
+                return await asyncio.wait_for(future, timeout=120.0)
             except asyncio.TimeoutError:
                 if request_id in self.response_futures:
                     del self.response_futures[request_id]
